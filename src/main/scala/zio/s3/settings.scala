@@ -21,7 +21,7 @@ import zio.{ IO, ZIO }
 
 final case class S3Credentials(accessKeyId: String, secretAccessKey: String)
 
-final private[s3] case class S3Settings(region: Region, credentials: S3Credentials)
+final case class S3Settings(region: Region, credentials: S3Credentials)
 
 object S3Settings {
 

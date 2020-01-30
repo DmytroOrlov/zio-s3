@@ -64,7 +64,7 @@ object S3 {
       key: String,
       contentLength: Long,
       contentType: String,
-      content: ZStreamChunk[R1, Throwable, Byte]
+      content: ZStream[R1, Throwable, ByteBuffer]
     ): ZIO[R1, S3Exception, Unit]
 
     def multipartUpload[R1 <: R](n: Int)(
@@ -134,10 +134,9 @@ object S3 {
       key: String,
       contentLength: Long,
       contentType: String,
-      content: ZStreamChunk[R1, Throwable, Byte]
+      content: ZStream[R1, Throwable, ByteBuffer]
     ): ZIO[Any with R1, S3Exception, Unit] =
-      content.chunks
-        .map(c => ByteBuffer.wrap(c.toArray))
+      content
         .toPublisher
         .flatMap(publisher =>
           execute(
@@ -332,11 +331,11 @@ object S3 {
       key: String,
       contentLength: Long,
       contentString: String,
-      content: ZStreamChunk[R1, Throwable, Byte]
+      content: ZStream[R1, Throwable, ByteBuffer]
     ): ZIO[R1, S3Exception, Unit] =
       ZManaged
         .fromAutoCloseable(Task(new FileOutputStream((path / bucketName / key).toFile)))
-        .use(os => content.run(ZSink.fromOutputStream(os)).unit)
+        .use(os => ZStreamChunk(content.map(bb => Chunk.fromArray(bb.array()))).run(ZSink.fromOutputStream(os)).unit)
         .mapError(S3ExceptionLike)
 
     override def execute[T](f: S3AsyncClient => CompletableFuture[T]): ZIO[Blocking, S3Exception, T] = ???
@@ -346,7 +345,7 @@ object S3 {
       key: String,
       contentType: String,
       content: ZStream[R1, Throwable, Byte]
-    ): ZIO[R1, S3Exception, Unit] = putObject(bucketName, key, 0, contentType, content.chunkN(10))
+    ): ZIO[R1, S3Exception, Unit] = putObject(bucketName, key, 0, contentType, content.chunkN(10).chunks.map(c => ByteBuffer.wrap(c.toArray)))
   }
 
   //TODO remove when TestEnvironment is fixed

@@ -1,6 +1,7 @@
 package zio.s3
 
 import java.net.URI
+import java.nio.ByteBuffer
 import java.nio.file.attribute.PosixFileAttributes
 import java.util.UUID
 
@@ -8,7 +9,7 @@ import software.amazon.awssdk.regions.Region
 import zio.Chunk
 import zio.blocking.Blocking
 import zio.nio.file.{ Files, Path }
-import zio.stream.{ ZSink, ZStream, ZStreamChunk }
+import zio.stream.{ ZSink, ZStream }
 import zio.test.Assertion._
 import zio.test._
 
@@ -178,12 +179,12 @@ object S3Test
           test.provideManaged(utils.s3)
         },
         testM("put object") {
-          val c      = Chunk.fromArray("Hello F World".getBytes)
-          val data   = ZStreamChunk.fromChunks(c)
+          val c = ByteBuffer.wrap("Hello F World".getBytes)
+          val data = ZStream.succeed(c)
           val tmpKey = Random.alphanumeric.take(10).mkString
 
           val test = for {
-            _ <- putObject_(bucketName, tmpKey, c.length.toLong, data)
+            _ <- putObject_(bucketName, tmpKey, c.remaining().toLong, data)
             fileSize <- Files
                          .readAttributes[PosixFileAttributes](Path(s"minio/data/$bucketName/$tmpKey"))
                          .map(_.size())

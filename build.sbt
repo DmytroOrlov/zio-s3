@@ -10,15 +10,13 @@ inThisBuild(
     ),
     Test / fork := true,
     parallelExecution in Test := false,
-    publishMavenStyle := true,
-    pgpPassphrase := sys.env.get("PGP_PASSWORD").map(_.toArray),
-    pgpPublicRing := file("/tmp/public.asc"),
-    pgpSecretRing := file("/tmp/secret.asc"),
     scmInfo := Some(
       ScmInfo(url("https://github.com/zio/zio-s3/"), "scm:git:git@github.com:zio/zio-s3.git")
     )
   )
 )
+
+ThisBuild / scalaVersion := "2.13.1"
 
 addCommandAlias("fmt", "all scalafmtSbt scalafmt test:scalafmt")
 addCommandAlias("check", "all scalafmtSbtCheck scalafmtCheck test:scalafmtCheck")
@@ -27,7 +25,9 @@ lazy val `zio-s3` = project
   .in(file("."))
   .settings(stdSettings("zio-s3"))
   .settings(
-    skip in publish := true,
+    inThisBuild(Seq(
+      publishTo := Some("releases" at "https://nexus.com/nexus/content/repositories/releases"),
+    )),
     libraryDependencies ++= Seq(
       "dev.zio"                %% "zio"                         % "1.0.0-RC17",
       "dev.zio"                %% "zio-streams"                 % "1.0.0-RC17",
@@ -41,22 +41,3 @@ lazy val `zio-s3` = project
     ),
     testFrameworks += new TestFramework("zio.test.sbt.ZTestFramework")
   )
-
-lazy val docs = project
-  .in(file("zio-s3-docs"))
-  .settings(
-    skip.in(publish) := true,
-    moduleName := "zio-s3-docs",
-    scalacOptions -= "-Yno-imports",
-    scalacOptions -= "-Xfatal-warnings",
-    libraryDependencies ++= Seq(
-      "dev.zio" %% "zio" % "1.0.0-RC17"
-    ),
-    unidocProjectFilter in (ScalaUnidoc, unidoc) := inProjects(`zio-s3`),
-    target in (ScalaUnidoc, unidoc) := (baseDirectory in LocalRootProject).value / "website" / "static" / "api",
-    cleanFiles += (target in (ScalaUnidoc, unidoc)).value,
-    docusaurusCreateSite := docusaurusCreateSite.dependsOn(unidoc in Compile).value,
-    docusaurusPublishGhpages := docusaurusPublishGhpages.dependsOn(unidoc in Compile).value
-  )
-  .dependsOn(`zio-s3`)
-  .enablePlugins(MdocPlugin, DocusaurusPlugin, ScalaUnidocPlugin)
