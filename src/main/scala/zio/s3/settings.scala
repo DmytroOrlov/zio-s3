@@ -25,7 +25,7 @@ import scala.util.Try
 
 final case class S3Credentials(accessKeyId: String, secretAccessKey: String)
 
-final private[s3] case class S3Settings(region: Region, credentials: S3Credentials, uriEndpoint: Option[URI])
+final case class S3Settings(region: Region, credentials: S3Credentials, uriEndpoint: Option[URI])
 
 object S3Settings {
 

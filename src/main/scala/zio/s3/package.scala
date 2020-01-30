@@ -16,6 +16,7 @@
 
 package zio
 
+import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
 
 import software.amazon.awssdk.services.s3.S3AsyncClient
@@ -81,7 +82,7 @@ package object s3 extends S3.Service[S3] {
     bucketName: String,
     key: String,
     contentLength: Long,
-    content: ZStreamChunk[R1, Throwable, Byte]
+    content: ZStream[R1, Throwable, ByteBuffer]
   ): ZIO[R1, S3Exception, Unit] =
     ZIO.accessM(_.s3.putObject(bucketName, key, contentLength, "application/octet-stream", content))
 
@@ -90,7 +91,7 @@ package object s3 extends S3.Service[S3] {
     key: String,
     contentLength: Long,
     contentType: String,
-    content: ZStreamChunk[R1, Throwable, Byte]
+    content: ZStream[R1, Throwable, ByteBuffer]
   ): ZIO[R1, S3Exception, Unit] =
     ZIO.accessM(_.s3.putObject(bucketName, key, contentLength, contentType, content))
 
@@ -101,7 +102,7 @@ package object s3 extends S3.Service[S3] {
     bucketName: String,
     key: String,
     contentType: String,
-    content: ZStreamChunk[R1, Throwable, Byte]
+    content: ZStream[R1, Throwable, ByteBuffer]
   ): ZIO[R1, S3Exception, Unit] =
     ZIO.accessM(_.s3.multipartUpload(n)(bucketName, key, contentType, content))
 }

@@ -1,6 +1,7 @@
 package zio.s3
 
 import java.net.URI
+import java.nio.ByteBuffer
 import java.nio.file.attribute.PosixFileAttributes
 import java.util.UUID
 
@@ -8,7 +9,7 @@ import software.amazon.awssdk.regions.Region
 import zio.{ Chunk, Managed }
 import zio.blocking.Blocking
 import zio.nio.file.{ Files, Path }
-import zio.stream.{ ZSink, ZStreamChunk }
+import zio.stream.{ ZSink, ZStream }
 import zio.test.Assertion._
 import zio.test._
 
@@ -177,12 +178,12 @@ object S3Test
           test.provideManaged(utils.s3)
         },
         testM("put object") {
-          val c      = Chunk.fromArray("Hello F World".getBytes)
-          val data   = ZStreamChunk.fromChunks(c)
+          val c = ByteBuffer.wrap("Hello F World".getBytes)
+          val data = ZStream.succeed(c)
           val tmpKey = Random.alphanumeric.take(10).mkString
 
           val test = for {
-            _ <- putObject_("bucket-1", tmpKey, c.length, data)
+            _ <- putObject_("bucket-1", tmpKey, c.remaining(), data)
             fileSize <- Files
                          .readAttributes[PosixFileAttributes](Path(s"minio/data/bucket-1/$tmpKey"))
                          .map(_.size())
@@ -208,15 +209,15 @@ object S3Test
                        |Aenean a massa feugiat, fringilla dui eget, ultrices velit.
                        |Aliquam pellentesque felis eget mi tincidunt dapibus vel at turpis.""".stripMargin
 
-          val data   = ZStreamChunk.fromChunks(Chunk.fromArray(text.getBytes))
+          val data = ZStream.succeed(ByteBuffer.wrap(text.getBytes))
           val tmpKey = Random.alphanumeric.take(10).mkString
 
           val test = for {
             _ <- multipartUpload(10)("bucket-1", tmpKey, "application/octet-stream", data)
             fileSize <- Files
-                         .readAttributes[PosixFileAttributes](Path(s"minio/data/bucket-1/$tmpKey"))
-                         .map(_.size())
-                         .provide(Blocking.Live)
+              .readAttributes[PosixFileAttributes](Path(s"minio/data/bucket-1/$tmpKey"))
+              .map(_.size())
+              .provide(Blocking.Live)
             fileExist <- Files.deleteIfExists(Path(s"minio/data/bucket-1/$tmpKey")).provide(Blocking.Live)
           } yield assert(fileExist, isTrue) && assert(fileSize, isGreaterThan(0L))
 

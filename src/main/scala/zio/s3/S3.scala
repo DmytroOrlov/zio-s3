@@ -66,14 +66,14 @@ object S3 {
       key: String,
       contentLength: Long,
       contentType: String,
-      content: ZStreamChunk[R1, Throwable, Byte]
+      content: ZStream[R1, Throwable, ByteBuffer]
     ): ZIO[R1, S3Exception, Unit]
 
     def multipartUpload[R1 <: R](n: Int)(
       bucketName: String,
       key: String,
       contentType: String,
-      content: ZStreamChunk[R1, Throwable, Byte]
+      content: ZStream[R1, Throwable, ByteBuffer]
     ): ZIO[R1, S3Exception, Unit]
 
     def execute[T](f: S3AsyncClient => CompletableFuture[T]): ZIO[R, S3Exception, T]
@@ -136,10 +136,9 @@ object S3 {
       key: String,
       contentLength: Long,
       contentType: String,
-      content: ZStreamChunk[R1, Throwable, Byte]
+      content: ZStream[R1, Throwable, ByteBuffer]
     ): ZIO[Any with R1, S3Exception, Unit] =
-      content.chunks
-        .map(c => ByteBuffer.wrap(c.toArray))
+      content
         .toPublisher
         .flatMap(
           publisher =>
@@ -162,7 +161,7 @@ object S3 {
       bucketName: String,
       key: String,
       contentType: String,
-      content: ZStreamChunk[R1, Throwable, Byte]
+      content: ZStream[R1, Throwable, ByteBuffer]
     ): ZIO[R1, S3Exception, Unit] =
       for {
         uploadId <- execute(
@@ -176,9 +175,9 @@ object S3 {
                      )
                    ).map(_.uploadId())
 
-        parts <- content.chunks.zipWithIndex
+        parts <- content.zipWithIndex
                   .mapMPar(n) {
-                    case (chunk, partNumber) =>
+                    case (bb, partNumber) =>
                       execute(
                         _.uploadPart(
                           UploadPartRequest
@@ -187,9 +186,9 @@ object S3 {
                             .key(key)
                             .partNumber(partNumber)
                             .uploadId(uploadId)
-                            .contentLength(chunk.length.toLong)
+                            .contentLength(bb.remaining().toLong)
                             .build(),
-                          AsyncRequestBody.fromByteBuffer(ByteBuffer.wrap(chunk.toArray))
+                          AsyncRequestBody.fromByteBuffer(bb)
                         )
                       )
                   }
@@ -324,11 +323,11 @@ object S3 {
       key: String,
       contentLength: Long,
       contentString: String,
-      content: ZStreamChunk[R1, Throwable, Byte]
+      content: ZStream[R1, Throwable, ByteBuffer]
     ): ZIO[R1, S3Exception, Unit] =
       ZManaged
         .fromAutoCloseable(Task(new FileOutputStream((path / bucketName / key).toFile)))
-        .use(os => content.run(ZSink.fromOutputStream(os)).unit)
+        .use(os => ZStreamChunk(content.map(bb => Chunk.fromArray(bb.array()))).run(ZSink.fromOutputStream(os)).unit)
         .mapError(S3ExceptionLike)
 
     override def execute[T](f: S3AsyncClient => CompletableFuture[T]): ZIO[Blocking, S3Exception, T] = ???
@@ -337,7 +336,7 @@ object S3 {
       bucketName: String,
       key: String,
       contentType: String,
-      content: ZStreamChunk[R1, Throwable, Byte]
+      content: ZStream[R1, Throwable, ByteBuffer]
     ): ZIO[R1, S3Exception, Unit] = putObject(bucketName, key, 0, contentType, content)
   }
 
