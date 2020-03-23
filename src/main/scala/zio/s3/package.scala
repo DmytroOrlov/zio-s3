@@ -16,93 +16,343 @@
 
 package zio
 
+import java.net.URI
 import java.nio.ByteBuffer
 import java.util.concurrent.CompletableFuture
 
+import software.amazon.awssdk.auth.credentials.{AwsBasicCredentials, StaticCredentialsProvider}
+import software.amazon.awssdk.core.async.{AsyncRequestBody, AsyncResponseTransformer, SdkPublisher}
+import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.s3.S3AsyncClient
-import software.amazon.awssdk.services.s3.model.S3Exception
+import software.amazon.awssdk.services.s3.model.{S3Exception, _}
+import zio.interop.javaz.fromCompletionStage
+import zio.interop.reactivestreams._
 import zio.s3.ZIOStreamUtils._
-import zio.stream.{ ZSink, ZStream, ZStreamChunk }
+import zio.stream.{StreamChunk, ZSink, ZStream, ZStreamChunk}
 
-package object s3 extends S3.Service[S3] {
-  type S3Stream[A] = ZStream[S3, S3Exception, A]
+import scala.jdk.CollectionConverters._
 
-  def listObjectsDescendant(bucketName: String, prefix: String): S3Stream[S3ObjectSummary] = accessStream[S3] { env =>
-    ZStream
-      .fromEffect(env.s3.listObjects(bucketName, prefix, 1000))
-      .flatMap(
-        paginate(_).mapConcat(_.objectSummaries)
-      )
-  }
+package object s3 {
 
-  def paginate(initialListing: S3ObjectListing): S3Stream[S3ObjectListing] = accessStream[S3] { env =>
-    ZStream.paginate(initialListing) {
-      case current @ S3ObjectListing(_, _, None) => ZIO.succeed(current -> None)
-      case current                               => env.s3.getNextObjects(current).map(next => current -> Some(next))
+  type S3 = Has[S3.Service]
+
+  object S3 {
+
+    trait Service {
+      def createBucket(bucketName: String): IO[S3Exception, Unit]
+
+      def deleteBucket(bucketName: String): IO[S3Exception, Unit]
+
+      def isBucketExists(bucketName: String): IO[S3Exception, Boolean]
+
+      def listBuckets(): IO[S3Exception, S3BucketListing]
+
+      def deleteObject(bucketName: String, key: String): IO[S3Exception, Unit]
+
+      def getObject(bucketName: String, key: String): StreamChunk[S3Exception, Byte]
+
+      def listObjects(bucketName: String, prefix: String, maxKeys: Int): IO[S3Exception, S3ObjectListing]
+
+      def getNextObjects(listing: S3ObjectListing): IO[S3Exception, S3ObjectListing]
+
+      def putObject[R](
+          bucketName: String,
+          key: String,
+          contentLength: Long,
+          contentType: String,
+          content: ZStream[R, Throwable, ByteBuffer]
+      ): ZIO[R, S3Exception, Unit]
+
+      def multipartUpload[R](n: Int)(
+          bucketName: String,
+          key: String,
+          contentType: String,
+          content: ZStream[R, Throwable, Byte]
+      ): ZIO[R, S3Exception, Unit]
+
+      def execute[T](f: S3AsyncClient => CompletableFuture[T]): IO[S3Exception, T]
     }
+
+    object Service {
+      def live(unsafeClient: S3AsyncClient): Service = new Service {
+
+        override def deleteObject(bucketName: String, key: String): ZIO[Any, S3Exception, Unit] =
+          execute(_.deleteObject(DeleteObjectRequest.builder().bucket(bucketName).key(key).build())).unit
+
+        override def createBucket(bucketName: String): ZIO[Any, S3Exception, Unit] =
+          execute(_.createBucket(CreateBucketRequest.builder().bucket(bucketName).build())).unit
+
+        override def deleteBucket(bucketName: String): ZIO[Any, S3Exception, Unit] =
+          execute(_.deleteBucket(DeleteBucketRequest.builder().bucket(bucketName).build())).unit
+
+        override def isBucketExists(bucketName: String): ZIO[Any, S3Exception, Boolean] =
+          execute(_.headBucket(HeadBucketRequest.builder().bucket(bucketName).build()))
+            .map(_ => true)
+            .catchSome {
+              case _: NoSuchBucketException => Task.succeed(false)
+            }
+
+        override def listBuckets(): ZIO[Any, S3Exception, S3BucketListing] =
+          execute(_.listBuckets())
+            .map(S3BucketListing(_))
+
+        override def getObject(bucketName: String, key: String): ZStreamChunk[Any, S3Exception, Byte] =
+          ZStreamChunk(
+            ZStream
+              .fromEffect(
+                execute(
+                  _.getObject[StreamResponse](
+                    GetObjectRequest.builder().bucket(bucketName).key(key).build(),
+                    StreamAsyncResponseTransformer(new CompletableFuture[StreamResponse]())
+                  )
+                )
+              )
+              .flatMap(identity)
+              .mapError(S3.S3ExceptionLike)
+          )
+
+        override def listObjects(bucketName: String, prefix: String, maxKeys: Int): ZIO[Any, S3Exception, S3ObjectListing] =
+          execute(
+            _.listObjectsV2(ListObjectsV2Request.builder().maxKeys(maxKeys).bucket(bucketName).prefix(prefix).build())
+          ).map(S3ObjectListing(_))
+
+        override def getNextObjects(listing: S3ObjectListing): ZIO[Any, S3Exception, S3ObjectListing] =
+          listing.nextContinuationToken
+            .fold[ZIO[Any, S3Exception, S3ObjectListing]](
+              ZIO.succeed(listing.copy(nextContinuationToken = None, objectSummaries = Nil))
+            ) { token =>
+              execute(
+                _.listObjectsV2(ListObjectsV2Request.builder().bucket(listing.bucketName).continuationToken(token).build())
+              ).map(S3ObjectListing(_))
+            }
+
+        override def putObject[R1](
+            bucketName: String,
+            key: String,
+            contentLength: Long,
+            contentType: String,
+            content: ZStream[R1, Throwable, ByteBuffer]
+        ): ZIO[Any with R1, S3Exception, Unit] =
+          content
+            .toPublisher
+            .flatMap(publisher =>
+              execute(
+                _.putObject(
+                  PutObjectRequest
+                    .builder()
+                    .bucket(bucketName)
+                    .contentLength(contentLength)
+                    .contentType(contentType)
+                    .key(key)
+                    .build(),
+                  AsyncRequestBody.fromPublisher(publisher)
+                )
+              )
+            )
+            .unit
+
+        // only for file which are bigger than 5 Mb
+        def multipartUpload[R1 <: Any](n: Int)(
+            bucketName: String,
+            key: String,
+            contentType: String,
+            content: ZStream[R1, Throwable, Byte]
+        ): ZIO[R1, S3Exception, Unit] =
+          for {
+            uploadId <- execute(
+              _.createMultipartUpload(
+                CreateMultipartUploadRequest
+                  .builder()
+                  .bucket(bucketName)
+                  .key(key)
+                  .contentType(contentType)
+                  .build()
+              )
+            ).map(_.uploadId())
+
+            parts <- content
+              //part size limit is 5Mb, required by amazon api
+              .chunkN(5 * 1024 * 1024)
+              .chunks
+              .zipWithIndex
+              .mapMPar(n) {
+                case (chunk, partNumber) =>
+                  execute(
+                    _.uploadPart(
+                      UploadPartRequest
+                        .builder()
+                        .bucket(bucketName)
+                        .key(key)
+                        .partNumber(partNumber.toInt + 1)
+                        .uploadId(uploadId)
+                        .contentLength(chunk.length.toLong)
+                        .build(),
+                      AsyncRequestBody.fromBytes(chunk.toArray)
+                    )
+                  ).map(r => CompletedPart.builder().partNumber(partNumber.toInt + 1).eTag(r.eTag()).build())
+              }
+              .runCollect
+              .mapError(S3ExceptionLike)
+
+            _ <- execute(
+              _.completeMultipartUpload(
+                CompleteMultipartUploadRequest
+                  .builder()
+                  .bucket(bucketName)
+                  .key(key)
+                  .multipartUpload(CompletedMultipartUpload.builder().parts(parts.asJavaCollection).build())
+                  .uploadId(uploadId)
+                  .build()
+              )
+            )
+          } yield ()
+
+        def execute[T](f: S3AsyncClient => CompletableFuture[T]): ZIO[Any, S3Exception, T] =
+          fromCompletionStage(f(unsafeClient)).refineToOrDie[S3Exception]
+      }
+    }
+
+    def connect(region: Region, credentials: S3Credentials): Managed[ConnectionError, Service] =
+      for {
+        settings <- S3Settings
+          .from(region, credentials)
+          .toManaged_
+          .mapError(e => ConnectionError(e.getMessage, e.getCause))
+        client <- connect(settings, None)
+      } yield client
+
+    def connect(settings: S3Settings, uriEndpoint: Option[URI]): Managed[ConnectionError, S3.Service] =
+      ZManaged
+        .fromAutoCloseable(
+          Task {
+            val builder = S3AsyncClient
+              .builder()
+              .credentialsProvider(
+                StaticCredentialsProvider.create(
+                  AwsBasicCredentials.create(settings.credentials.accessKeyId, settings.credentials.secretAccessKey)
+                )
+              )
+              .region(settings.region)
+            uriEndpoint.foreach(builder.endpointOverride)
+            builder.build()
+          }
+        )
+        .map(client =>
+          Service.live(client)
+        )
+        .mapError(e => ConnectionError(e.getMessage, e.getCause))
+
+    private[s3] case class S3ExceptionLike(error: Throwable)
+      extends S3Exception(S3Exception.builder().message(error.getMessage).cause(error.getCause))
+
+    type StreamResponse = ZStream[Any, Throwable, Chunk[Byte]]
+
+    final private[s3] case class StreamAsyncResponseTransformer(cf: CompletableFuture[StreamResponse])
+      extends AsyncResponseTransformer[GetObjectResponse, StreamResponse] {
+      override def prepare(): CompletableFuture[StreamResponse] = cf
+
+      override def onResponse(response: GetObjectResponse): Unit = ()
+
+      override def onStream(publisher: SdkPublisher[ByteBuffer]): Unit = {
+        cf.complete(publisher.toStream().map(ChunkUtils.fromByteBuffer))
+        ()
+      }
+
+      override def exceptionOccurred(error: Throwable): Unit = {
+        cf.completeExceptionally(error)
+        ()
+      }
+    }
+
+    // TODO environment problem since we have Blocking Context and
+    //  object Test {
+    //
+    //    def connect(path: Path): ZManaged[Blocking, Nothing, S3] =
+    //      ZManaged.succeed(new S3 {
+    //        protected override val s3: Service[Any] = new Test(ZPath.fromJava(path))
+    //      })
+    //  }
+
+    type S3Stream[A] = ZStream[S3, S3Exception, A]
+
+    def listObjectsDescendant(bucketName: String, prefix: String): S3Stream[S3ObjectSummary] = accessStream[S3] { env =>
+      ZStream
+        .fromEffect(env.get.listObjects(bucketName, prefix, 1000))
+        .flatMap(
+          paginate(_).mapConcat(_.objectSummaries)
+        )
+    }
+
+    def paginate(initialListing: S3ObjectListing): S3Stream[S3ObjectListing] = accessStream[S3] { env =>
+      ZStream.paginateM(initialListing) {
+        case current@S3ObjectListing(_, _, None) => ZIO.succeed(current -> None)
+        case current => env.get.getNextObjects(current).map(next => current -> Some(next))
+      }
+    }
+
+    def streamLines(objectSummary: S3ObjectSummary): S3Stream[String] = accessStream[S3] {
+      _.get
+        .getObject(objectSummary.bucketName, objectSummary.key)
+        .chunks
+        .aggregate(ZSink.utf8DecodeChunk)
+        .aggregate(ZSink.splitLines)
+        .mapConcatChunk(identity)
+    }
+
+    def createBucket(bucketName: String): ZIO[S3, S3Exception, Unit] =
+      ZIO.accessM(_.get.createBucket(bucketName))
+
+    def deleteBucket(bucketName: String): ZIO[S3, S3Exception, Unit] =
+      ZIO.accessM(_.get.deleteBucket(bucketName))
+
+    def isBucketExists(bucketName: String): ZIO[S3, S3Exception, Boolean] =
+      ZIO.accessM(_.get.isBucketExists(bucketName))
+
+    def listBuckets(): ZIO[S3, S3Exception, S3BucketListing] =
+      ZIO.accessM(_.get.listBuckets())
+
+    def deleteObject(bucketName: String, key: String): ZIO[S3, S3Exception, Unit] =
+      ZIO.accessM(_.get.deleteObject(bucketName, key))
+
+    def getObject(bucketName: String, key: String): ZStreamChunk[S3, S3Exception, Byte] =
+      ZStreamChunk(accessStream(_.get.getObject(bucketName, key).chunks))
+
+    def listObjects_(bucketName: String): ZIO[S3, S3Exception, S3ObjectListing] =
+      ZIO.accessM(_.get.listObjects(bucketName, "", 1000))
+
+    def listObjects(bucketName: String, prefix: String, maxKeys: Int): ZIO[S3, S3Exception, S3ObjectListing] =
+      ZIO.accessM(_.get.listObjects(bucketName, prefix, maxKeys))
+
+    def getNextObjects(listing: S3ObjectListing): ZIO[S3, S3Exception, S3ObjectListing] =
+      ZIO.accessM(_.get.getNextObjects(listing))
+
+    def putObject_[R1 <: S3](
+        bucketName: String,
+        key: String,
+        contentLength: Long,
+        content: ZStream[R1, Throwable, ByteBuffer]
+    ): ZIO[R1, S3Exception, Unit] =
+      ZIO.accessM(_.get.putObject(bucketName, key, contentLength, "application/octet-stream", content))
+
+    def putObject[R1 <: S3](
+        bucketName: String,
+        key: String,
+        contentLength: Long,
+        contentType: String,
+        content: ZStream[R1, Throwable, ByteBuffer]
+    ): ZIO[R1, S3Exception, Unit] =
+      ZIO.accessM(_.get.putObject(bucketName, key, contentLength, contentType, content))
+
+    def execute[T](f: S3AsyncClient => CompletableFuture[T]): ZIO[S3, S3Exception, T] =
+      ZIO.accessM(_.get.execute(f))
+
+    def multipartUpload[R1 <: S3](n: Int)(
+        bucketName: String,
+        key: String,
+        contentType: String,
+        content: ZStream[R1, Throwable, Byte]
+    ): ZIO[R1, S3Exception, Unit] =
+      ZIO.accessM(_.get.multipartUpload(n)(bucketName, key, contentType, content))
   }
 
-  def streamLines(objectSummary: S3ObjectSummary): S3Stream[String] = accessStream[S3] {
-    _.s3
-      .getObject(objectSummary.bucketName, objectSummary.key)
-      .chunks
-      .aggregate(ZSink.utf8DecodeChunk)
-      .aggregate(ZSink.splitLines)
-      .mapConcatChunk(identity)
-  }
-
-  def createBucket(bucketName: String): ZIO[S3, S3Exception, Unit] =
-    ZIO.accessM(_.s3.createBucket(bucketName))
-
-  def deleteBucket(bucketName: String): ZIO[S3, S3Exception, Unit] =
-    ZIO.accessM(_.s3.deleteBucket(bucketName))
-
-  def isBucketExists(bucketName: String): ZIO[S3, S3Exception, Boolean] =
-    ZIO.accessM(_.s3.isBucketExists(bucketName))
-
-  def listBuckets(): ZIO[S3, S3Exception, S3BucketListing] =
-    ZIO.accessM(_.s3.listBuckets())
-
-  def deleteObject(bucketName: String, key: String): ZIO[S3, S3Exception, Unit] =
-    ZIO.accessM(_.s3.deleteObject(bucketName, key))
-
-  def getObject(bucketName: String, key: String): ZStreamChunk[S3, S3Exception, Byte] =
-    ZStreamChunk(accessStream(_.s3.getObject(bucketName, key).chunks))
-
-  def listObjects_(bucketName: String): ZIO[S3, S3Exception, S3ObjectListing] =
-    ZIO.accessM(_.s3.listObjects(bucketName, "", 1000))
-
-  def listObjects(bucketName: String, prefix: String, maxKeys: Int): ZIO[S3, S3Exception, S3ObjectListing] =
-    ZIO.accessM(_.s3.listObjects(bucketName, prefix, maxKeys))
-
-  def getNextObjects(listing: S3ObjectListing): ZIO[S3, S3Exception, S3ObjectListing] =
-    ZIO.accessM(_.s3.getNextObjects(listing))
-
-  def putObject_[R1 <: S3](
-    bucketName: String,
-    key: String,
-    contentLength: Long,
-    content: ZStream[R1, Throwable, ByteBuffer]
-  ): ZIO[R1, S3Exception, Unit] =
-    ZIO.accessM(_.s3.putObject(bucketName, key, contentLength, "application/octet-stream", content))
-
-  def putObject[R1 <: S3](
-    bucketName: String,
-    key: String,
-    contentLength: Long,
-    contentType: String,
-    content: ZStream[R1, Throwable, ByteBuffer]
-  ): ZIO[R1, S3Exception, Unit] =
-    ZIO.accessM(_.s3.putObject(bucketName, key, contentLength, contentType, content))
-
-  def execute[T](f: S3AsyncClient => CompletableFuture[T]): ZIO[S3, S3Exception, T] =
-    ZIO.accessM(_.s3.execute(f))
-
-  def multipartUpload[R1 <: S3](n: Int)(
-    bucketName: String,
-    key: String,
-    contentType: String,
-    content: ZStream[R1, Throwable, Byte]
-  ): ZIO[R1, S3Exception, Unit] =
-    ZIO.accessM(_.s3.multipartUpload(n)(bucketName, key, contentType, content))
 }
